@@ -21,6 +21,7 @@ diesel::table! {
         status -> Text,
         created_at -> Timestamp,
         chain -> Text,
+        activated_at -> Nullable<Timestamp>,
     }
 }
 

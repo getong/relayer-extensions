@@ -1,5 +1,7 @@
 //! Queries for managing custody data
 
+use std::time::SystemTime;
+
 use diesel::{ExpressionMethods, OptionalExtension, QueryDsl};
 use diesel_async::RunQueryDsl;
 use renegade_util::err_str;
@@ -49,16 +51,23 @@ impl CustodyClient {
     /// Used to make registration idempotent per peer-id: a relayer that
     /// re-registers (e.g. on reboot) should be handed back its existing wallet
     /// rather than draining a fresh inactive wallet from the pool.
-    pub async fn find_active_gas_wallet_for_peer(
+    /// Find a live (active or pending) gas wallet owned by a peer.
+    ///
+    /// Includes `pending` wallets so that a peer re-registering after a brief
+    /// topology drop reclaims its existing wallet instead of drawing a fresh one
+    /// from the inactive pool (which leaks the pending wallet). An active wallet
+    /// is preferred when both exist (`active` sorts before `pending`).
+    pub async fn find_live_gas_wallet_for_peer(
         &self,
         peer_id: &str,
     ) -> Result<Option<GasWallet>, FundsManagerError> {
         let mut conn = self.get_db_conn().await?;
-        let active = GasWalletStatus::Active.to_string();
+        let inactive = GasWalletStatus::Inactive.to_string();
         gas_wallets::table
-            .filter(gas_wallets::status.eq(active))
+            .filter(gas_wallets::status.ne(inactive))
             .filter(gas_wallets::peer_id.eq(peer_id))
             .filter(gas_wallets::chain.eq(to_env_agnostic_name(self.chain)))
+            .order_by(gas_wallets::status.asc())
             .first::<GasWallet>(&mut conn)
             .await
             .optional()
@@ -200,7 +209,11 @@ impl CustodyClient {
         let active = GasWalletStatus::Active.to_string();
 
         for (address, peer_id) in wallets {
-            let updates = (gas_wallets::status.eq(&active), gas_wallets::peer_id.eq(*peer_id));
+            let updates = (
+                gas_wallets::status.eq(&active),
+                gas_wallets::peer_id.eq(*peer_id),
+                gas_wallets::activated_at.eq(SystemTime::now()),
+            );
             diesel::update(
                 gas_wallets::table
                     .filter(gas_wallets::address.eq(*address))

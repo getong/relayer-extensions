@@ -1,6 +1,7 @@
 //! Handlers for gas wallet operations
 
 use std::str::FromStr;
+use std::time::Duration;
 
 use alloy::{hex::ToHexExt, signers::local::PrivateKeySigner};
 
@@ -99,9 +100,16 @@ impl CustodyClient {
         &self,
         peer_id: &str,
     ) -> Result<String, FundsManagerError> {
-        // If this peer already has an active wallet, return its key (idempotent)
-        let gas_wallet = match self.find_active_gas_wallet_for_peer(peer_id).await? {
-            Some(existing) => existing,
+        // If this peer already has a live wallet, return its key (idempotent).
+        // A wallet that drifted to `pending` (one missed report cycle) is
+        // re-activated rather than left to leak while a fresh wallet is drawn.
+        let gas_wallet = match self.find_live_gas_wallet_for_peer(peer_id).await? {
+            Some(existing) => {
+                if existing.status != GasWalletStatus::Active.to_string() {
+                    self.mark_gas_wallet_active(&existing.address, peer_id).await?;
+                }
+                existing
+            },
             None => {
                 // Otherwise allocate a fresh inactive wallet for the peer
                 let wallet = self.find_inactive_gas_wallet().await?;
@@ -118,8 +126,8 @@ impl CustodyClient {
         Ok(secret_value)
     }
 
-    /// Record the set of active peers, marking their gas wallets as active and
-    /// transitioning the rest to inactive or pending if necessary
+    /// Record the set of active peers: re-activate wallets whose peer reappeared
+    /// and step the rest toward inactive (honoring the reclaim grace period)
     pub(crate) async fn record_active_gas_wallet(
         &self,
         active_peers: Vec<String>,
@@ -127,8 +135,6 @@ impl CustodyClient {
         // Fetch all gas wallets
         let all_wallets = self.get_all_gas_wallets().await?;
 
-        // For those gas wallets whose peer is not in the active peers list, mark them
-        // as inactive
         for wallet in all_wallets {
             let state =
                 GasWalletStatus::from_str(&wallet.status).expect("invalid gas wallet status");
@@ -137,31 +143,19 @@ impl CustodyClient {
                 None => continue,
             };
 
-            if !active_peers.contains(&peer_id) {
-                // Grace period: do not begin reclaiming a wallet that was registered
-                // within the last `GAS_WALLET_RECLAIM_GRACE`. This protects a
-                // slow-booting worker whose peer has not yet reported. Only the
-                // Active->Pending step is gated; once a wallet is already Pending it
-                // is older than the grace and may proceed toward Inactive.
-                if state == GasWalletStatus::Active
-                    && wallet
-                        .created_at
-                        .elapsed()
-                        .map(|age| age < GAS_WALLET_RECLAIM_GRACE)
-                        .unwrap_or(false)
-                {
-                    continue;
-                }
-
-                match state.transition_inactive() {
-                    GasWalletStatus::Pending => {
-                        self.mark_gas_wallet_pending(&wallet.address).await?;
-                    },
-                    GasWalletStatus::Inactive => {
-                        self.mark_gas_wallet_inactive(&wallet.address).await?;
-                    },
-                    _ => unreachable!(),
-                }
+            let peer_active = active_peers.contains(&peer_id);
+            let activated_elapsed = wallet.activated_at.and_then(|t| t.elapsed().ok());
+            match gas_wallet_report_action(&state, peer_active, activated_elapsed) {
+                GasWalletReportAction::None => {},
+                GasWalletReportAction::Activate => {
+                    self.mark_gas_wallet_active(&wallet.address, &peer_id).await?;
+                },
+                GasWalletReportAction::MarkPending => {
+                    self.mark_gas_wallet_pending(&wallet.address).await?;
+                },
+                GasWalletReportAction::MarkInactive => {
+                    self.mark_gas_wallet_inactive(&wallet.address).await?;
+                },
             }
         }
 
@@ -260,5 +254,122 @@ impl CustodyClient {
         // Refill the balance
         let needs = amount - bal;
         self.transfer_ether(addr, needs, signer).await.map(|_| ())
+    }
+}
+
+// -------------------------
+// | Report cycle decision |
+// -------------------------
+
+/// The action to take for a gas wallet during an active-peers report cycle
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum GasWalletReportAction {
+    /// Leave the wallet unchanged
+    None,
+    /// Re-activate a wallet whose peer reappeared (un-debounce a Pending wallet)
+    Activate,
+    /// Step the wallet one transition toward inactive (Active -> Pending)
+    MarkPending,
+    /// Mark the wallet inactive, returning it to the pool (Pending -> Inactive)
+    MarkInactive,
+}
+
+/// Decide what to do with a single gas wallet during a report cycle.
+///
+/// - `peer_active`: whether the wallet's peer is in the active-peers list.
+/// - `activated_elapsed`: time since the wallet was last activated, if known.
+///
+/// When the peer is present we re-activate a wallet that had drifted to
+/// `Pending` so it is not leaked. When the peer is absent we step the wallet
+/// toward inactive, but a freshly-activated `Active` wallet is held for one
+/// cycle (the grace period) to protect a slow-booting worker whose peer has not
+/// yet appeared in topology.
+pub(crate) fn gas_wallet_report_action(
+    status: &GasWalletStatus,
+    peer_active: bool,
+    activated_elapsed: Option<Duration>,
+) -> GasWalletReportAction {
+    if peer_active {
+        match status {
+            GasWalletStatus::Pending => GasWalletReportAction::Activate,
+            _ => GasWalletReportAction::None,
+        }
+    } else {
+        match status {
+            GasWalletStatus::Active => {
+                let within_grace = activated_elapsed
+                    .map(|age| age < GAS_WALLET_RECLAIM_GRACE)
+                    .unwrap_or(false);
+                if within_grace {
+                    GasWalletReportAction::None
+                } else {
+                    GasWalletReportAction::MarkPending
+                }
+            },
+            GasWalletStatus::Pending => GasWalletReportAction::MarkInactive,
+            GasWalletStatus::Inactive => GasWalletReportAction::None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        gas_wallet_report_action, GasWalletReportAction, GasWalletStatus, GAS_WALLET_RECLAIM_GRACE,
+    };
+
+    /// A duration safely inside the grace window
+    fn within_grace() -> std::time::Duration {
+        GAS_WALLET_RECLAIM_GRACE / 2
+    }
+
+    /// A duration safely past the grace window
+    fn past_grace() -> std::time::Duration {
+        GAS_WALLET_RECLAIM_GRACE * 2
+    }
+
+    #[test]
+    fn peer_active_pending_is_reactivated() {
+        let action =
+            gas_wallet_report_action(&GasWalletStatus::Pending, true, Some(past_grace()));
+        assert_eq!(action, GasWalletReportAction::Activate);
+    }
+
+    #[test]
+    fn peer_active_active_is_unchanged() {
+        let action = gas_wallet_report_action(&GasWalletStatus::Active, true, Some(past_grace()));
+        assert_eq!(action, GasWalletReportAction::None);
+    }
+
+    #[test]
+    fn peer_absent_active_within_grace_is_held() {
+        let action =
+            gas_wallet_report_action(&GasWalletStatus::Active, false, Some(within_grace()));
+        assert_eq!(action, GasWalletReportAction::None);
+    }
+
+    #[test]
+    fn peer_absent_active_past_grace_goes_pending() {
+        let action = gas_wallet_report_action(&GasWalletStatus::Active, false, Some(past_grace()));
+        assert_eq!(action, GasWalletReportAction::MarkPending);
+    }
+
+    #[test]
+    fn peer_absent_active_unknown_activation_goes_pending() {
+        // No activation timestamp => not protected by the grace period
+        let action = gas_wallet_report_action(&GasWalletStatus::Active, false, None);
+        assert_eq!(action, GasWalletReportAction::MarkPending);
+    }
+
+    #[test]
+    fn peer_absent_pending_goes_inactive() {
+        let action = gas_wallet_report_action(&GasWalletStatus::Pending, false, Some(past_grace()));
+        assert_eq!(action, GasWalletReportAction::MarkInactive);
+    }
+
+    #[test]
+    fn peer_absent_inactive_is_unchanged() {
+        let action = gas_wallet_report_action(&GasWalletStatus::Inactive, false, None);
+        assert_eq!(action, GasWalletReportAction::None);
     }
 }

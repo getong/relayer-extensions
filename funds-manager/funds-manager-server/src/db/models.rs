@@ -176,6 +176,11 @@ pub struct GasWallet {
     pub status: String,
     pub created_at: SystemTime,
     pub chain: String,
+    /// When the wallet was last activated (assigned to a peer).
+    ///
+    /// Used to measure the reclaim grace period from activation rather than row
+    /// creation; `None` for wallets that have never been activated.
+    pub activated_at: Option<SystemTime>,
 }
 
 impl GasWallet {
@@ -184,7 +189,15 @@ impl GasWallet {
         let id = Uuid::new_v4();
         let status = GasWalletStatus::Inactive.to_string();
         let chain = to_env_agnostic_name(chain);
-        GasWallet { id, address, peer_id: None, status, created_at: SystemTime::now(), chain }
+        GasWallet {
+            id,
+            address,
+            peer_id: None,
+            status,
+            created_at: SystemTime::now(),
+            chain,
+            activated_at: None,
+        }
     }
 }
 
